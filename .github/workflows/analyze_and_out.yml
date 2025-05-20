@@ -232,7 +232,7 @@ jobs:
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/testing-organization-jcayllahua/library-mono-repo/issues \
+            /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues \
             -F "title=🔐 Correcciones de Seguridad: Falló la construcción del proyecto cliente" \
             -F "body=${body}" \
             -F "labels[]=security-patch" \
