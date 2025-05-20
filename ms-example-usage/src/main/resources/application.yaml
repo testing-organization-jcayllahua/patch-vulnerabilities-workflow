@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: ms-example-usage
+  r2dbc:
+    url: ${DB_URI}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+

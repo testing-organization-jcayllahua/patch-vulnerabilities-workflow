@@ -1,0 +1,255 @@
+name: Analyze & Patch Project Vulnerabilities
+on:
+  workflow_call:
+    outputs:
+     branch_created:
+       description: "The branche name created for patch"
+       value: ${{ jobs.patch_vulnerabilities.outputs.branch_name }}
+     dependencies:
+       description: "The dependencies modified and new versions"
+       value: ${{ jobs.patch_vulnerabilities.outputs.patched_dependencies }}
+    secrets:
+      token:
+        required: true
+      DB_URL:
+        required: true
+      DB_USER:
+        required: true
+      DB_PASSWORD:
+        required: true
+
+jobs:
+  patch_vulnerabilities:
+    runs-on: ubuntu-latest
+    outputs:
+      patched_dependencies: ${{ steps.patch_vulnerabilities.outputs.patched_dependencies }}
+      branch_name: ${{ steps.branch_creation.outputs.branch_name }}
+    steps:
+    
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+      - name: Fetch Vulnerabilities
+        env:
+          API_TOKEN: ${{ secrets.token }}
+        run: |
+          echo "${{ github.event.repository.name }}"
+          echo "${{ github.repository_owner }}"
+          QUERY=$(cat <<'EOF'
+          {
+            "query": "query ($org: String = \"\", $repo: String! = \"\") { organization(login: $org) { repository(name: $repo) { name vulnerabilityAlerts(first: 100, states: OPEN) { nodes { dependencyRelationship vulnerableManifestPath securityVulnerability { advisory { ghsaId summary } severity package { name ecosystem } firstPatchedVersion { identifier } vulnerableVersionRange } } } } } }",
+            "variables": {
+              "org": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}"
+            }
+          }
+          EOF
+          )
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$QUERY" \
+            https://api.github.com/graphql)
+            
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" > vulnerabilities.json
+          echo "$RESPONSE" | jq -c '.data.organization.repository.vulnerabilityAlerts.nodes[]' > vulnerabilities_list.json
+          
+      - name: Classify Vulnerable Dependencies in library subproject
+        working-directory: library-example
+        run: |
+          gradle dependencies > gradle_dependencies.txt
+          gradle buildEnvironment > gradle_build_env.txt
+          touch found_in_dependencies.txt
+          touch found_in_build_env.txt
+          jq -c '.' ../vulnerabilities_list.json | while read -r vuln; do
+            PACKAGE=$(echo "$vuln" | jq -r '.securityVulnerability.package.name')
+            if grep -q "$PACKAGE" gradle_dependencies.txt; then
+              echo "$vuln" >> found_in_dependencies.txt
+            fi
+            if grep -q "$PACKAGE" gradle_build_env.txt; then
+              echo "$vuln" >> found_in_build_env.txt
+            fi
+          done
+          
+      - name: Patch Vulnerable Dependencies in library subproject
+        id: patch_vulnerabilities
+        working-directory: library-example
+        run: |
+              declare -A latest_versions
+              patched_deps=()
+          
+              patch_gradle() {
+                local GROUP=$1
+                local ARTIFACT=$2
+                local VERSION=$3
+          
+                if [ -z "$VERSION" ] || [ "$VERSION" == "null" ]; then
+                  echo "WARNING: No patched version found for ${GROUP}:${ARTIFACT}, skipping..."
+                  return 1
+                fi
+          
+                local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
+                local DIRECT_DEP_REGEX="['\"]${GROUP}:${ARTIFACT}:[^'\"]*['\"]"
+                local NEW_DEP="'${GROUP}:${ARTIFACT}:${VERSION}'"
+          
+                if grep -qE "$DIRECT_DEP_REGEX" build.gradle; then
+                  echo "→ Updating direct dependency for ${GROUP}:${ARTIFACT}"
+                  sed -i -E "s|$DIRECT_DEP_REGEX|$NEW_DEP|g" build.gradle
+                  return 0
+                fi
+          
+                echo "→ ${GROUP}:${ARTIFACT} not found directly, patching via resolutionStrategy.force"
+          
+                if grep -q "configurations.all[[:space:]]*{" build.gradle; then
+                  if grep -A 10 "configurations.all[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
+                    if grep -q "force[[:space:]]*'${GROUP}:${ARTIFACT}:" build.gradle; then
+                      sed -i "s|force[[:space:]]*'${GROUP}:${ARTIFACT}:[^']*'|${PATCH_LINE}|g" build.gradle
+                    else
+                      awk -v patch="$PATCH_LINE" '
+                        /resolutionStrategy[[:space:]]*{/ { print; in_block=1; next }
+                        in_block && /^\s*}/ { print "        " patch; in_block=0 }
+                        { print }
+                      ' build.gradle > tmp && mv tmp build.gradle
+                    fi
+                  else
+                    awk -v patch="$PATCH_LINE" '
+                      /configurations.all[[:space:]]*{/ {
+                        print; print "    resolutionStrategy {"; print "        " patch; print "    }"; next
+                      }
+                      { print }
+                    ' build.gradle > tmp && mv tmp build.gradle
+                  fi
+                else
+                  awk -v patch="$PATCH_LINE" '
+                    /^dependencies[[:space:]]*{/ {
+                      print "configurations.all {";
+                      print "    resolutionStrategy {";
+                      print "        " patch;
+                      print "    }";
+                      print "}"; print ""; print $0; next;
+                    }
+                    { print }
+                  ' build.gradle > tmp && mv tmp build.gradle
+                fi
+              }
+          
+              for FILE in found_in_dependencies.txt found_in_build_env.txt; do
+                if [ -f "$FILE" ]; then
+                  while read -r entry; do
+                    PACKAGE=$(echo "$entry" | jq -r '.securityVulnerability.package.name')
+                    PATCHED_VERSION=$(echo "$entry" | jq -r '.securityVulnerability.firstPatchedVersion.identifier')
+                    GROUP=$(echo "$PACKAGE" | cut -d':' -f1)
+                    ARTIFACT=$(echo "$PACKAGE" | cut -d':' -f2)
+                    KEY="${GROUP}:${ARTIFACT}"
+          
+                    [ "$PATCHED_VERSION" = "null" ] && continue
+          
+                    if [[ -z "${latest_versions[$KEY]}" || "$PATCHED_VERSION" > "${latest_versions[$KEY]}" ]]; then
+                      latest_versions[$KEY]=$PATCHED_VERSION
+                    fi
+                  done < "$FILE"
+                fi
+              done
+          
+              # Patch only latest versions and add to patched_deps once
+              for KEY in "${!latest_versions[@]}"; do
+                GROUP=$(echo "$KEY" | cut -d':' -f1)
+                ARTIFACT=$(echo "$KEY" | cut -d':' -f2)
+                VERSION="${latest_versions[$KEY]}"
+                echo "→ Patching $KEY to version $VERSION"
+                patch_gradle "$GROUP" "$ARTIFACT" "$VERSION"
+                patched_deps+=("${GROUP}:${ARTIFACT}:${VERSION}")
+              done
+          
+              joined=$(IFS=, ; echo "${patched_deps[*]}")
+              echo "patched_dependencies=$joined" >> "$GITHUB_OUTPUT"
+
+      - name: Build with Gradle
+        run: |
+          echo "DB URL IS $DB_URI"
+          ./gradlew :ms-example-usage:build
+        env:
+          DB_URI: ${{ secrets.DB_URL }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+      - name: All tests passed
+        if: ${{ success() }}
+        run: echo "✅ All tests passed!"
+
+      - name: Build failed
+        if: ${{ failure() }}
+        run: echo "❌ Build or tests failed"
+
+      - name: Create Issue
+        env:
+            DEPS: ${{ steps.patch_vulnerabilities.outputs.dependencies }}
+            BRANCH_NAME: ${{ steps.patch_vulnerabilities.outputs.branch_created }}
+            GH_TOKEN: ${{ secrets.token }}
+        if: ${{ failure() }}
+        run: |
+          IFS=',' read -ra deps_array <<< "$DEPS" 
+          formatted_changes=""
+          
+          for dep in "${deps_array[@]}"; do
+            GROUP=$(echo "$dep" | cut -d':' -f1)
+            ARTIFACT=$(echo "$dep" | cut -d':' -f2)
+            VERSION=$(echo "$dep" | cut -d':' -f3)
+            formatted_changes+="- ⬆️ Actualización de \`${GROUP}:${ARTIFACT}\` a \`${VERSION}\`
+          "
+          done
+          
+          # Create the body content with proper newlines
+          body=$(cat <<EOF
+          ## 🛡️ Resumen
+          
+          Este issue documenta la resolución de vulnerabilidades de seguridad identificadas en escaneos recientes de dependencias. Sin embargo, **el build del proyecto falló después de aplicar las correciones.**
+
+          Por favor, investiga los errores y determina si las fallas están relacionadas con la compatibilidad de los cambios introducidos.
+          
+          ## 🔧 Cambios Realizados
+          
+          ${formatted_changes}
+          
+          ## 📚 Referencias
+          
+          - 📌 Alertas de Dependabot  
+          - 🕵️‍♂️ Base de Datos de CVEs (if applicable)
+          
+          ## ✅ Próximos pasos
+          
+          - [ ] 🔍 Verificar la compatibilidad de las dependencias actualizadas
+          - [ ] 📦 Revisar los logs del proceso de compilación
+          - [ ] 🔁 Coordinar con el equipo de seguridad para la revisión final
+          EOF)
+          
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/testing-organization-jcayllahua/library-mono-repo/issues \
+            -F "title=🔐 Correcciones de Seguridad: Falló la construcción del proyecto cliente" \
+            -F "body=${body}" \
+            -F "labels[]=security-patch" \
+            -F "type=Security"
+          
+
+      - name: Create Patch Branch, Commit & Push
+        id: branch_creation
+        if: ${{ success() }}
+        run: |
+          BRANCH_NAME="fix/security-patch-$(TZ=America/Lima date +%F)"
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH_NAME"
+          git add library-example/build.gradle
+          git commit -m "Patch vulnerable dependencies"
+          git push origin "$BRANCH_NAME"
+          
+      - name: Show Final build.gradle (library)
+        working-directory: library-example
+        run: cat build.gradle

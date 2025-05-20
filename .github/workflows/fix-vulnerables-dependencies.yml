@@ -1,0 +1,144 @@
+name: Analyze Patch Vulnerabilities
+on:
+  workflow_dispatch:
+jobs:
+  analyzing_vulnerabilities:
+
+    uses: ./.github/workflows/analyze_and_out.yml
+    secrets:
+      token: ${{secrets.API_TOKEN_GH}}
+      DB_URL: ${{ secrets.DB_URL }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+  run-and-test:
+    runs-on: ubuntu-latest
+    needs: analyzing_vulnerabilities
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{needs.analyzing_vulnerabilities.outputs.branch_created}}
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+
+      - name: Pull JDK
+        run: docker pull openjdk:17-jdk-slim
+        
+      - uses: grafana/setup-k6-action@v1
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          
+      - name: Build Application
+        run: ./gradlew :ms-example-usage:build
+        env:
+          DB_URI: ${{ secrets.DB_URL }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+      - name: Run docker compose with logs
+        working-directory: ms-example-usage
+        run: |
+          docker build -t my-app .
+          docker run \
+            -e DB_URI="${DB_URL}" \
+            -e DB_USER="${DB_USER}" \
+            -e DB_PASSWORD="${DB_PASSWORD}" \
+            --network host \
+            -p 8080:8080 \
+            --name my-app my-app &
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          
+      - name: Run Grafana k6 tests
+        id: k6-test
+        uses: grafana/run-k6-action@v1.2.0
+        with:
+          debug: true
+          path: |
+            ./ms-example-usage/k6-tests-2*.js 
+
+      - name: Show App Logs
+        if: ${{ always() }}
+        run: docker logs my-app
+      - name: Archive K6 Test Reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results
+          path: ./index.html
+          retention-days: 1
+
+      - name: Create Security Patch Issue
+        if: ${{ failure() }}
+        env:
+          DEPS: ${{ needs.analyzing_vulnerabilities.outputs.dependencies }}
+          BRANCH_NAME: ${{ needs.analyzing_vulnerabilities.outputs.branch_created }}
+          GH_TOKEN: ${{ secrets.API_TOKEN_GH }}
+        run: |
+          IFS=',' read -ra deps_array <<< "$DEPS" 
+          formatted_changes=""
+          
+          for dep in "${deps_array[@]}"; do
+            GROUP=$(echo "$dep" | cut -d':' -f1)
+            ARTIFACT=$(echo "$dep" | cut -d':' -f2)
+            VERSION=$(echo "$dep" | cut -d':' -f3)
+            formatted_changes+="- ⬆️ Actualización de \`${GROUP}:${ARTIFACT}\` a \`${VERSION}\`
+          "
+          done
+          
+          # Create the body content with proper newlines
+          body=$(cat <<EOF
+          ## 🛡️ Resumen
+          
+          Este issue documenta la resolución de vulnerabilidades de seguridad identificadas en escaneos recientes de dependencias. Sin embargo, **las pruebas automatizadas fallaron después de aplicar las correcciones.**
+
+          Por favor, investiga los errores y determina si las fallas están relacionadas con los cambios introducidos o si son problemas preexistentes.
+          
+          ## ❌ Resultados de las Pruebas K6
+          
+          - ❗ Algunas pruebas fallaron tras aplicar los parches de seguridad.
+          - 📄 [Ver reporte completo de pruebas K6](https://testing-organization-jcayllahua.github.io/library-mono-repo/index.html)
+
+          ## 🔧 Cambios Realizados
+          
+          ${formatted_changes}
+          
+          ## 📚 Referencias
+          
+          - 📌 Alertas de Dependabot  
+          - 🧾 Auditoría Interna de Seguridad
+          - 🕵️‍♂️ Base de Datos de CVEs (if applicable)
+          
+          ## ✅ Próximos pasos
+          
+          - [ ] 🔍 Verificar el suite de pruebas en staging
+          - [ ] 📦 Monitorear los despliegues en busca de errores
+          - [ ] 🔁 Coordinar con el equipo de seguridad para la revisión final
+          
+          🔗 Rama con la corrección: [${BRANCH_NAME}](https://github.com/testing-organization-jcayllahua/library-mono-repo/tree/${BRANCH_NAME})
+          EOF
+          )
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/testing-organization-jcayllahua/library-mono-repo/issues \
+            -F "title=🔐 Correcciones de Seguridad: Fallaron las pruebas tras aplicar los parches" \
+            -F "body=${body}" \
+            -F "labels[]=security-patch" \
+            -F "type=Security"
+            
+      - name: Deploy
+        if: ${{ always() }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
