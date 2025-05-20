@@ -104,7 +104,7 @@ jobs:
           ## ❌ Resultados de las Pruebas K6
           
           - ❗ Algunas pruebas fallaron tras aplicar los parches de seguridad.
-          - 📄 [Ver reporte completo de pruebas K6](https://testing-organization-jcayllahua.github.io/library-mono-repo/index.html)
+          - 📄 [Ver reporte completo de pruebas K6](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/index.html)
 
           ## 🔧 Cambios Realizados
           
@@ -122,7 +122,7 @@ jobs:
           - [ ] 📦 Monitorear los despliegues en busca de errores
           - [ ] 🔁 Coordinar con el equipo de seguridad para la revisión final
           
-          🔗 Rama con la corrección: [${BRANCH_NAME}](https://github.com/testing-organization-jcayllahua/library-mono-repo/tree/${BRANCH_NAME})
+          🔗 Rama con la corrección: [${BRANCH_NAME}](https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/tree/${BRANCH_NAME})
           EOF
           )
 
@@ -130,7 +130,7 @@ jobs:
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/testing-organization-jcayllahua/library-mono-repo/issues \
+            /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues \
             -F "title=🔐 Correcciones de Seguridad: Fallaron las pruebas tras aplicar los parches" \
             -F "body=${body}" \
             -F "labels[]=security-patch" \
