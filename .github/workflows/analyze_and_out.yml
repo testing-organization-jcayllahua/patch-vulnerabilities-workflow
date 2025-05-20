@@ -37,8 +37,6 @@ jobs:
         env:
           API_TOKEN: ${{ secrets.token }}
         run: |
-          echo "${{ github.event.repository.name }}"
-          echo "${{ github.repository_owner }}"
           QUERY=$(cat <<'EOF'
           {
             "query": "query ($org: String = \"\", $repo: String! = \"\") { organization(login: $org) { repository(name: $repo) { name vulnerabilityAlerts(first: 100, states: OPEN) { nodes { dependencyRelationship vulnerableManifestPath securityVulnerability { advisory { ghsaId summary } severity package { name ecosystem } firstPatchedVersion { identifier } vulnerableVersionRange } } } } } }",
@@ -171,7 +169,6 @@ jobs:
 
       - name: Build with Gradle
         run: |
-          echo "DB URL IS $DB_URI"
           ./gradlew :ms-example-usage:build
         env:
           DB_URI: ${{ secrets.DB_URL }}

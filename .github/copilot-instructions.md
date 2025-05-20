@@ -1,5 +1,9 @@
 # Mono Repo Security Patches Workflows Project
 
+## Commit Message
+
+- The commit message should be in the format of conventional commits.
+
 ## Copilot Chat Rules
 
 - Every time you are asked for how to run the code, consider all the points described in the section "Required Secrets".
